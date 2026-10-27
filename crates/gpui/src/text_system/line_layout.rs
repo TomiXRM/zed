@@ -8,6 +8,7 @@ use std::{
     ops::Range,
     sync::Arc,
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::LineWrapper;
 
@@ -125,6 +126,9 @@ impl LineLayout {
         None
     }
 
+    // UAX #14 supplies legal byte boundaries (including Japanese kinsoku).
+    // Intersect those with shaped grapheme boundaries, never glyph count:
+    // a cluster can contain several glyphs, including across font runs.
     fn compute_wrap_boundaries(
         &self,
         text: &str,
@@ -132,77 +136,66 @@ impl LineLayout {
         max_lines: Option<usize>,
     ) -> SmallVec<[WrapBoundary; 1]> {
         let mut boundaries = SmallVec::new();
-        let mut first_non_whitespace_ix = None;
-        let mut last_candidate_ix = None;
-        let mut last_candidate_x = px(0.);
-        let mut last_boundary = WrapBoundary {
-            run_ix: 0,
-            glyph_ix: 0,
-        };
+        let mut opportunities = unicode_linebreak::linebreaks(text).peekable();
+        let mut graphemes = text.grapheme_indices(true).peekable();
+        let mut last_candidate = None;
+        let mut last_boundary = WrapBoundary { run_ix: 0, glyph_ix: 0 };
         let mut last_boundary_x = px(0.);
         let mut prev_ch = '\0';
-        let mut glyphs = self
-            .runs
-            .iter()
-            .enumerate()
-            .flat_map(move |(run_ix, run)| {
-                run.glyphs.iter().enumerate().map(move |(glyph_ix, glyph)| {
-                    let character = text[glyph.index..].chars().next().unwrap();
-                    (
-                        WrapBoundary { run_ix, glyph_ix },
-                        character,
-                        glyph.position.x,
-                    )
-                })
+        let mut glyphs = self.runs.iter().enumerate().flat_map(|(run_ix, run)| {
+            run.glyphs.iter().enumerate().map(move |(glyph_ix, glyph)| {
+                (WrapBoundary { run_ix, glyph_ix }, glyph)
             })
-            .peekable();
+        }).peekable();
 
-        while let Some((boundary, ch, x)) = glyphs.next() {
+        while let Some((boundary, glyph)) = glyphs.next() {
+            let index = glyph.index;
+            while graphemes.peek().is_some_and(|(ix, _)| *ix < index) {
+                graphemes.next();
+            }
+            // A shaper may omit a boundary (e.g. a ligature); only
+            // boundaries represented by both streams are usable.
+            let Some(&(grapheme_index, grapheme)) = graphemes.peek() else {
+                break;
+            };
+            if grapheme_index != index {
+                continue;
+            }
+            let end = index + grapheme.len();
+            while glyphs.peek().is_some_and(|(_, next)| next.index < end) {
+                glyphs.next();
+            }
+            let ch = grapheme.chars().next().unwrap();
             if ch == '\n' {
                 continue;
             }
-
-            // Here is very similar to `LineWrapper::wrap_line` to determine text wrapping,
-            // but there are some differences, so we have to duplicate the code here.
-            if LineWrapper::is_word_char(ch) {
-                if prev_ch == ' ' && ch != ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = Some(boundary);
-                    last_candidate_x = x;
-                }
-            } else {
-                if ch != ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = Some(boundary);
-                    last_candidate_x = x;
-                }
+            let x = glyph.position.x;
+            while opportunities.peek().is_some_and(|(ix, _)| *ix < index) {
+                opportunities.next();
+            }
+            if opportunities.peek().is_some_and(|(ix, _)| *ix == index)
+                && boundary > last_boundary
+                // Keep GPUI's existing word tailoring (a-b, Self::new, etc.).
+                && !(LineWrapper::is_word_char(prev_ch) && LineWrapper::is_word_char(ch))
+            {
+                last_candidate = Some((boundary, x));
             }
 
-            if ch != ' ' && first_non_whitespace_ix.is_none() {
-                first_non_whitespace_ix = Some(boundary);
-            }
-
-            let next_x = glyphs.peek().map_or(self.width, |(_, _, x)| *x);
-            let width = next_x - last_boundary_x;
-
-            if width > wrap_width && boundary > last_boundary {
-                // When used line_clamp, we should limit the number of lines.
-                if let Some(max_lines) = max_lines
-                    && boundaries.len() >= max_lines.saturating_sub(1)
-                {
+            let next_x = glyphs.peek().map_or(self.width, |(_, next)| next.position.x);
+            if next_x - last_boundary_x > wrap_width && boundary > last_boundary {
+                if max_lines.is_some_and(|max| boundaries.len() >= max.saturating_sub(1)) {
                     break;
                 }
-
-                if let Some(last_candidate_ix) = last_candidate_ix.take() {
-                    last_boundary = last_candidate_ix;
-                    last_boundary_x = last_candidate_x;
-                } else {
-                    last_boundary = boundary;
-                    last_boundary_x = x;
-                }
+                // Emergency wrapping is needed for an over-wide word/unit,
+                // but must still never split a combining/emoji cluster.
+                let (next_boundary, next_boundary_x) =
+                    last_candidate.take().unwrap_or((boundary, x));
+                last_boundary = next_boundary;
+                last_boundary_x = next_boundary_x;
                 boundaries.push(last_boundary);
             }
-            prev_ch = ch;
+            prev_ch = grapheme.chars().next_back().unwrap();
         }
-
         boundaries
     }
 }
@@ -983,6 +976,119 @@ mod tests {
             }],
             len: 0,
         }
+    }
+
+    fn monospace_layout(text: &str) -> LineLayout {
+        let glyphs = text.char_indices().enumerate()
+            .map(|(column, (index, _))| glyph_at(column as f32, index))
+            .collect();
+        let mut layout = make_layout(glyphs);
+        layout.width = px(text.chars().count() as f32);
+        layout.len = text.len();
+        layout
+    }
+
+    fn wrapped_text<'a>(
+        layout: &LineLayout,
+        text: &'a str,
+        width: f32,
+        max_lines: Option<usize>,
+    ) -> Vec<&'a str> {
+        let mut start = 0;
+        let mut lines = Vec::new();
+        for boundary in layout.compute_wrap_boundaries(text, px(width), max_lines) {
+            let end = layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index;
+            assert!(end > start, "wrap boundaries must advance");
+            lines.push(&text[start..end]);
+            start = end;
+        }
+        lines.push(&text[start..]);
+        lines
+    }
+
+    #[test]
+    fn test_wrap_japanese_closing_punctuation() {
+        for punctuation in ["。", "、", "・", "」", "』", "）", "】", "！", "？"] {
+            let text = format!("あい{punctuation}う");
+            assert_eq!(
+                wrapped_text(&monospace_layout(&text), &text, 2., None),
+                vec!["あ".to_owned(), format!("い{punctuation}"), "う".to_owned()],
+                "{punctuation}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_wrap_japanese_opening_punctuation() {
+        for punctuation in ["「", "『", "（", "【"] {
+            let text = format!("あ{punctuation}いう");
+            assert_eq!(
+                wrapped_text(&monospace_layout(&text), &text, 2., None),
+                vec!["あ".to_owned(), format!("{punctuation}い"), "う".to_owned()],
+                "{punctuation}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_wrap_words_cjk_and_emergency() {
+        for (text, width, expected) in [
+            ("hello world", 7., vec!["hello ", "world"]),
+            ("a-b c", 3., vec!["a-b", " c"]),
+            ("abcdef", 2., vec!["ab", "cd", "ef"]),
+            ("あいうえお", 2., vec!["あい", "うえ", "お"]),
+            ("あいう", 0., vec!["あ", "い", "う"]),
+            ("あ。い", 1., vec!["あ", "。", "い"]),
+            ("", 2., vec![""]),
+        ] {
+            assert_eq!(wrapped_text(&monospace_layout(text), text, width, None), expected);
+        }
+    }
+
+    #[test]
+    fn test_wrap_clamps_and_exact_fit() {
+        let text = "あい。うえ";
+        let layout = monospace_layout(text);
+        assert_eq!(wrapped_text(&layout, text, 2., Some(2)), ["あ", "い。うえ"]);
+        assert_eq!(wrapped_text(&layout, text, 2., Some(1)), [text]);
+        assert_eq!(wrapped_text(&layout, text, 2., Some(0)), [text]);
+        assert_eq!(wrapped_text(&layout, text, 5., None), [text]);
+    }
+
+    #[test]
+    fn test_wrap_combining_clusters_across_runs() {
+        let text = "a\u{301}b";
+        let mut layout = make_layout(vec![glyph_at(0., 0)]);
+        layout.runs.push(ShapedRun {
+            font_id: FontId(1),
+            glyphs: vec![glyph_at(0.5, 1), glyph_at(2., 3)],
+        });
+        layout.width = px(3.);
+        layout.len = text.len();
+        assert_eq!(wrapped_text(&layout, text, 1., None), ["a\u{301}", "b"]);
+        // Some backends assign every glyph in a cluster the same byte index.
+        layout.runs[1].glyphs[0].index = 0;
+        assert_eq!(wrapped_text(&layout, text, 1., None), ["a\u{301}", "b"]);
+    }
+
+    #[test]
+    fn test_wrap_emoji_cluster_and_ligature() {
+        let text = "👩‍💻あ";
+        assert_eq!(wrapped_text(&monospace_layout(text), text, 1., None), ["👩‍💻", "あ"]);
+        let text = "ffiあい";
+        let mut layout = make_layout(vec![glyph_at(0., 0), glyph_at(2., 3), glyph_at(3., 6)]);
+        layout.width = px(4.);
+        layout.len = text.len();
+        assert_eq!(wrapped_text(&layout, text, 2., None), ["ffi", "あい"]);
+    }
+
+    #[test]
+    fn test_wrap_japanese_across_font_runs() {
+        let text = "あい。う";
+        let mut layout = monospace_layout(text);
+        let remaining = layout.runs[0].glyphs.split_off(2);
+        layout.runs.push(ShapedRun { font_id: FontId(1), glyphs: remaining });
+        assert_eq!(wrapped_text(&layout, text, 2., None), ["あ", "い。", "う"]);
     }
 
     fn glyph_x_positions(layout: &LineLayout) -> Vec<f32> {

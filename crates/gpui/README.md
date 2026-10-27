@@ -47,6 +47,17 @@ The features on `gpui_platform` are platform-specific, so the list above is a sa
 - [Ownership and data flow](_ownership_and_data_flow)
 - [Accessibility](_accessibility)
 
+### Text wrapping
+
+Shaped line layouts use Unicode line-break opportunities, including Japanese
+opening/closing punctuation rules, while retaining GPUI's word tailoring.
+Wrap boundaries refer to UTF-8 indices in shaped glyph runs and never divide an
+extended grapheme cluster. When a word or punctuation unit is wider than the
+available width, emergency wrapping can break that unit between graphemes;
+an individual over-wide grapheme remains intact. Line clamps still limit the
+number of emitted lines. This applies to shaped layouts on all platforms;
+the character-width `LineWrapper` used by editor callers is unchanged.
+
 ### Dependencies
 
 GPUI has various system dependencies that it needs in order to work.
