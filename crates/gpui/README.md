@@ -58,6 +58,11 @@ an individual over-wide grapheme remains intact. Line clamps still limit the
 number of emitted lines. This applies to shaped layouts on all platforms;
 the character-width `LineWrapper` used by editor callers is unchanged.
 
+Text measurement caches distinguish both wrapping and truncation widths,
+including unbounded requests. In particular, intrinsic measurement after a
+narrow truncated measurement must use the original text, not a cached ellipsis.
+Repeated measurements with identical constraints reuse the shaped layout.
+
 ### Dependencies
 
 GPUI has various system dependencies that it needs in order to work.

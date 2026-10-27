@@ -618,8 +618,25 @@ struct TextLayoutInner {
     lines: SmallVec<[WrappedLine; 1]>,
     line_height: Pixels,
     wrap_width: Option<Pixels>,
+    truncate_width: Option<Pixels>,
     size: Option<Size<Pixels>>,
     bounds: Option<Bounds<Pixels>>,
+}
+
+impl TextLayoutInner {
+    fn size_for_constraints(
+        &self,
+        wrap_width: Option<Pixels>,
+        truncate_width: Option<Pixels>,
+    ) -> Option<Size<Pixels>> {
+        // An unbounded request must not reuse a previous constrained layout:
+        // its text may already be wrapped or replaced by a truncation affix.
+        if self.wrap_width == wrap_width && self.truncate_width == truncate_width {
+            self.size
+        } else {
+            None
+        }
+    }
 }
 
 impl TextLayout {
@@ -675,15 +692,8 @@ impl TextLayout {
                         (None, "".into(), TruncateFrom::End)
                     };
 
-                // Only use cached layout if:
-                // 1. We have a cached size
-                // 2. wrap_width matches (or both are None)
-                // 3. truncate_width is None (if truncate_width is Some, we need to re-layout
-                //    because the previous layout may have been computed without truncation)
                 if let Some(text_layout) = element_state.0.borrow().as_ref()
-                    && let Some(size) = text_layout.size
-                    && (wrap_width.is_none() || wrap_width == text_layout.wrap_width)
-                    && truncate_width.is_none()
+                    && let Some(size) = text_layout.size_for_constraints(wrap_width, truncate_width)
                 {
                     return size;
                 }
@@ -731,6 +741,7 @@ impl TextLayout {
                         len: 0,
                         line_height,
                         wrap_width,
+                        truncate_width,
                         size: Some(Size::default()),
                         bounds: None,
                     });
@@ -749,6 +760,7 @@ impl TextLayout {
                     len,
                     line_height,
                     wrap_width,
+                    truncate_width,
                     size: Some(size),
                     bounds: None,
                 });
@@ -1258,6 +1270,73 @@ impl IntoElement for InteractiveText {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cached_text_layout(
+        wrap_width: Option<Pixels>,
+        truncate_width: Option<Pixels>,
+    ) -> TextLayoutInner {
+        TextLayoutInner {
+            len: 0,
+            lines: SmallVec::new(),
+            line_height: px(21.),
+            wrap_width,
+            truncate_width,
+            size: Some(Size {
+                width: px(70.),
+                height: px(21.),
+            }),
+            bounds: None,
+        }
+    }
+
+    #[test]
+    fn text_layout_cache_rejects_truncated_to_unbounded() {
+        // Browser flex measurement: Definite(0) shapes an ellipsis, then
+        // MaxContent must measure the original caption, not that ellipsis.
+        for width in [0., 12., 122.] {
+            let cached = cached_text_layout(None, Some(px(width)));
+            assert_eq!(cached.size_for_constraints(None, None), None);
+        }
+    }
+
+    #[test]
+    fn text_layout_cache_rejects_changed_constraints() {
+        let unbounded = cached_text_layout(None, None);
+        assert_eq!(unbounded.size_for_constraints(None, Some(px(122.))), None);
+        let truncated = cached_text_layout(None, Some(px(122.)));
+        assert_eq!(truncated.size_for_constraints(None, Some(px(12.))), None);
+        let wrapped = cached_text_layout(Some(px(122.)), None);
+        assert_eq!(wrapped.size_for_constraints(None, None), None);
+        assert_eq!(wrapped.size_for_constraints(Some(px(100.)), None), None);
+        assert_eq!(
+            wrapped.size_for_constraints(Some(px(122.)), Some(px(122.))),
+            None
+        );
+    }
+
+    #[test]
+    fn text_layout_cache_reuses_identical_constraints() {
+        for (wrap_width, truncate_width) in [
+            (None, None),
+            (None, Some(px(0.))),
+            (None, Some(px(122.))),
+            (Some(px(122.)), None),
+            (Some(px(122.)), Some(px(244.))),
+        ] {
+            let cached = cached_text_layout(wrap_width, truncate_width);
+            assert_eq!(
+                cached.size_for_constraints(wrap_width, truncate_width),
+                cached.size
+            );
+        }
+    }
+
+    #[test]
+    fn text_layout_cache_requires_measured_size() {
+        let mut cached = cached_text_layout(None, None);
+        cached.size = None;
+        assert_eq!(cached.size_for_constraints(None, None), None);
+    }
 
     #[test]
     fn test_into_element_for() {
