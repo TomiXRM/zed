@@ -1093,6 +1093,23 @@ mod tests {
     }
 
     #[test]
+    fn test_wrap_mixed_japanese_emergency_nearby_widths() {
+        // A native CoreText smoke exposed punctuation stranded after an
+        // emergency break inside a Latin word in this mixed-script text.
+        let text = "日本語とEnglish words、a-b、Self::newを表示します。";
+        let layout = monospace_layout(text);
+        for width in 5..=16 {
+            let lines = wrapped_text(&layout, text, width as f32, None);
+            assert_eq!(lines.concat(), text);
+            for line in lines {
+                assert!(!line.is_empty());
+                assert!(line.chars().count() <= width, "{width}: {line:?}");
+                assert!(!line.starts_with(['。', '、', '・']), "{width}: {line:?}");
+            }
+        }
+    }
+
+    #[test]
     fn test_wrap_clamps_and_exact_fit() {
         let text = "あい。うえ";
         let layout = monospace_layout(text);
