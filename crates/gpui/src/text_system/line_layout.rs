@@ -135,18 +135,30 @@ impl LineLayout {
         wrap_width: Pixels,
         max_lines: Option<usize>,
     ) -> SmallVec<[WrapBoundary; 1]> {
+        use unicode_linebreak::BreakClass;
         let mut boundaries = SmallVec::new();
         let mut opportunities = unicode_linebreak::linebreaks(text).peekable();
         let mut graphemes = text.grapheme_indices(true).peekable();
         let mut last_candidate = None;
-        let mut last_boundary = WrapBoundary { run_ix: 0, glyph_ix: 0 };
+        let mut last_emergency_candidate = None;
+        let mut previous_non_space_class = BreakClass::Unknown;
+        let mut last_boundary = WrapBoundary {
+            run_ix: 0,
+            glyph_ix: 0,
+        };
         let mut last_boundary_x = px(0.);
         let mut prev_ch = '\0';
-        let mut glyphs = self.runs.iter().enumerate().flat_map(|(run_ix, run)| {
-            run.glyphs.iter().enumerate().map(move |(glyph_ix, glyph)| {
-                (WrapBoundary { run_ix, glyph_ix }, glyph)
+        let mut glyphs = self
+            .runs
+            .iter()
+            .enumerate()
+            .flat_map(|(run_ix, run)| {
+                run.glyphs
+                    .iter()
+                    .enumerate()
+                    .map(move |(glyph_ix, glyph)| (WrapBoundary { run_ix, glyph_ix }, glyph))
             })
-        }).peekable();
+            .peekable();
 
         while let Some((boundary, glyph)) = glyphs.next() {
             let index = glyph.index;
@@ -180,16 +192,44 @@ impl LineLayout {
             {
                 last_candidate = Some((boundary, x));
             }
+            // If an over-wide word needs an emergency break, prefer a
+            // grapheme boundary that still respects punctuation attachment.
+            // In particular, move the final letter with its closing mark,
+            // rather than leaving that mark alone on the next line.
+            let class = unicode_linebreak::break_property(ch as u32);
+            if previous_non_space_class != BreakClass::OpenPunctuation
+                && !matches!(
+                    class,
+                    BreakClass::ClosePunctuation
+                        | BreakClass::CloseParenthesis
+                        | BreakClass::Exclamation
+                        | BreakClass::InfixSeparator
+                        | BreakClass::Symbol
+                        | BreakClass::NonStarter
+                        | BreakClass::ConditionalJapaneseStarter
+                )
+            {
+                last_emergency_candidate = Some((boundary, x));
+            }
+            if class != BreakClass::Space {
+                previous_non_space_class = class;
+            }
 
-            let next_x = glyphs.peek().map_or(self.width, |(_, next)| next.position.x);
+            let next_x = glyphs
+                .peek()
+                .map_or(self.width, |(_, next)| next.position.x);
             if next_x - last_boundary_x > wrap_width && boundary > last_boundary {
                 if max_lines.is_some_and(|max| boundaries.len() >= max.saturating_sub(1)) {
                     break;
                 }
                 // Emergency wrapping is needed for an over-wide word/unit,
                 // but must still never split a combining/emoji cluster.
-                let (next_boundary, next_boundary_x) =
-                    last_candidate.take().unwrap_or((boundary, x));
+                let (next_boundary, next_boundary_x) = last_candidate
+                    .take()
+                    .or_else(|| {
+                        last_emergency_candidate.filter(|(candidate, _)| *candidate > last_boundary)
+                    })
+                    .unwrap_or((boundary, x));
                 last_boundary = next_boundary;
                 last_boundary_x = next_boundary_x;
                 boundaries.push(last_boundary);
@@ -979,7 +1019,9 @@ mod tests {
     }
 
     fn monospace_layout(text: &str) -> LineLayout {
-        let glyphs = text.char_indices().enumerate()
+        let glyphs = text
+            .char_indices()
+            .enumerate()
             .map(|(column, (index, _))| glyph_at(column as f32, index))
             .collect();
         let mut layout = make_layout(glyphs);
@@ -1036,12 +1078,17 @@ mod tests {
             ("hello world", 7., vec!["hello ", "world"]),
             ("a-b c", 3., vec!["a-b", " c"]),
             ("abcdef", 2., vec!["ab", "cd", "ef"]),
+            ("words、a", 5., vec!["word", "s、a"]),
+            ("abcde。f", 5., vec!["abcd", "e。f"]),
             ("あいうえお", 2., vec!["あい", "うえ", "お"]),
             ("あいう", 0., vec!["あ", "い", "う"]),
             ("あ。い", 1., vec!["あ", "。", "い"]),
             ("", 2., vec![""]),
         ] {
-            assert_eq!(wrapped_text(&monospace_layout(text), text, width, None), expected);
+            assert_eq!(
+                wrapped_text(&monospace_layout(text), text, width, None),
+                expected
+            );
         }
     }
 
@@ -1074,7 +1121,10 @@ mod tests {
     #[test]
     fn test_wrap_emoji_cluster_and_ligature() {
         let text = "👩‍💻あ";
-        assert_eq!(wrapped_text(&monospace_layout(text), text, 1., None), ["👩‍💻", "あ"]);
+        assert_eq!(
+            wrapped_text(&monospace_layout(text), text, 1., None),
+            ["👩‍💻", "あ"]
+        );
         let text = "ffiあい";
         let mut layout = make_layout(vec![glyph_at(0., 0), glyph_at(2., 3), glyph_at(3., 6)]);
         layout.width = px(4.);
@@ -1087,7 +1137,10 @@ mod tests {
         let text = "あい。う";
         let mut layout = monospace_layout(text);
         let remaining = layout.runs[0].glyphs.split_off(2);
-        layout.runs.push(ShapedRun { font_id: FontId(1), glyphs: remaining });
+        layout.runs.push(ShapedRun {
+            font_id: FontId(1),
+            glyphs: remaining,
+        });
         assert_eq!(wrapped_text(&layout, text, 2., None), ["あ", "い。", "う"]);
     }
 
