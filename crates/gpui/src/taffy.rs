@@ -113,6 +113,7 @@ impl TaffyLayoutEngine {
 
     /// Refresh a measured leaf's state for its final logical-pixel size without
     /// changing the geometry selected by Taffy.
+    #[stacksafe]
     pub(crate) fn refresh_measurement(
         &mut self,
         id: LayoutId,
