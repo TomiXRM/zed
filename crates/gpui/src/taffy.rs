@@ -111,6 +111,27 @@ impl TaffyLayoutEngine {
             .into()
     }
 
+    /// Refresh a measured leaf's state for its final logical-pixel size without
+    /// changing the geometry selected by Taffy.
+    pub(crate) fn refresh_measurement(
+        &mut self,
+        id: LayoutId,
+        final_size: Size<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let context = self
+            .taffy
+            .get_node_context_mut(id.into())
+            .expect("measured layout must retain its measurement context");
+        (context.measure)(
+            final_size.map(Some),
+            final_size.map(AvailableSpace::Definite),
+            window,
+            cx,
+        );
+    }
+
     /// Treats any `auto` dimension of the given node's style as filling `size`.
     ///
     /// This is applied to window roots before layout so they behave like the

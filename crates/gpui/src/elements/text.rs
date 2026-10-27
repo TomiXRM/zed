@@ -281,10 +281,10 @@ impl Element for &'static str {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         text_layout: &mut Self::RequestLayoutState,
-        _window: &mut Window,
-        _cx: &mut App,
+        window: &mut Window,
+        cx: &mut App,
     ) {
-        text_layout.prepaint(bounds, self)
+        text_layout.prepaint(bounds, self, window, cx)
     }
 
     fn paint(
@@ -355,10 +355,10 @@ impl Element for SharedString {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         text_layout: &mut Self::RequestLayoutState,
-        _window: &mut Window,
-        _cx: &mut App,
+        window: &mut Window,
+        cx: &mut App,
     ) {
-        text_layout.prepaint(bounds, self.as_ref())
+        text_layout.prepaint(bounds, self.as_ref(), window, cx)
     }
 
     fn paint(
@@ -581,10 +581,10 @@ impl Element for StyledText {
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
-        _window: &mut Window,
-        _cx: &mut App,
+        window: &mut Window,
+        cx: &mut App,
     ) {
-        self.layout.prepaint(bounds, &self.text)
+        self.layout.prepaint(bounds, &self.text, window, cx)
     }
 
     fn paint(
@@ -611,7 +611,14 @@ impl IntoElement for StyledText {
 
 /// The Layout for TextElement. This can be used to map indices to pixels and vice versa.
 #[derive(Default, Clone)]
-pub struct TextLayout(Rc<RefCell<Option<TextLayoutInner>>>);
+pub struct TextLayout(Rc<RefCell<TextLayoutState>>);
+
+#[derive(Default)]
+struct TextLayoutState {
+    // Keep the request ID shared with inspection clones, just like the layout.
+    layout_id: Option<LayoutId>,
+    layout: Option<TextLayoutInner>,
+}
 
 struct TextLayoutInner {
     len: usize,
@@ -660,7 +667,7 @@ impl TextLayout {
         } else {
             vec![text_style.to_run(text.len())]
         };
-        window.request_measured_layout(Default::default(), {
+        let layout_id = window.request_measured_layout(Default::default(), {
             let element_state = self.clone();
 
             move |known_dimensions, available_space, window, cx| {
@@ -692,7 +699,7 @@ impl TextLayout {
                         (None, "".into(), TruncateFrom::End)
                     };
 
-                if let Some(text_layout) = element_state.0.borrow().as_ref()
+                if let Some(text_layout) = element_state.0.borrow().layout.as_ref()
                     && let Some(size) = text_layout.size_for_constraints(wrap_width, truncate_width)
                 {
                     return size;
@@ -736,15 +743,19 @@ impl TextLayout {
                     )
                     .log_err()
                 else {
-                    element_state.0.borrow_mut().replace(TextLayoutInner {
-                        lines: Default::default(),
-                        len: 0,
-                        line_height,
-                        wrap_width,
-                        truncate_width,
-                        size: Some(Size::default()),
-                        bounds: None,
-                    });
+                    element_state
+                        .0
+                        .borrow_mut()
+                        .layout
+                        .replace(TextLayoutInner {
+                            lines: Default::default(),
+                            len: 0,
+                            line_height,
+                            wrap_width,
+                            truncate_width,
+                            size: Some(Size::default()),
+                            bounds: None,
+                        });
                     return Size::default();
                 };
 
@@ -755,24 +766,44 @@ impl TextLayout {
                     size.width = size.width.max(line_size.width).ceil();
                 }
 
-                element_state.0.borrow_mut().replace(TextLayoutInner {
-                    lines,
-                    len,
-                    line_height,
-                    wrap_width,
-                    truncate_width,
-                    size: Some(size),
-                    bounds: None,
-                });
+                element_state
+                    .0
+                    .borrow_mut()
+                    .layout
+                    .replace(TextLayoutInner {
+                        lines,
+                        len,
+                        line_height,
+                        wrap_width,
+                        truncate_width,
+                        size: Some(size),
+                        bounds: None,
+                    });
 
                 size
             }
-        })
+        });
+        let mut state = self.0.borrow_mut();
+        state.layout_id = Some(layout_id);
+        // Cache entries belong to this closure's immutable text and style.
+        state.layout = None;
+        layout_id
     }
 
-    fn prepaint(&self, bounds: Bounds<Pixels>, text: &str) {
+    fn prepaint(&self, bounds: Bounds<Pixels>, text: &str, window: &mut Window, cx: &mut App) {
+        // Taffy can reuse a cached measurement for the final geometry without
+        // invoking our closure again. The last shaped text may therefore belong
+        // to a different width. Restore it through the original closure, which
+        // retains the resolved runs and style and skips shaping on an exact hit.
+        let layout_id = self
+            .0
+            .borrow()
+            .layout_id
+            .expect("text layout must be requested before prepaint");
+        window.refresh_measurement(layout_id, bounds.size, cx);
         let mut element_state = self.0.borrow_mut();
         let element_state = element_state
+            .layout
             .as_mut()
             .with_context(|| format!("measurement has not been performed on {text}"))
             .unwrap();
@@ -782,6 +813,7 @@ impl TextLayout {
     fn paint(&self, text: &str, window: &mut Window, cx: &mut App) {
         let element_state = self.0.borrow();
         let element_state = element_state
+            .layout
             .as_ref()
             .with_context(|| format!("measurement has not been performed on {text}"))
             .unwrap();
@@ -820,6 +852,7 @@ impl TextLayout {
     pub fn index_for_position(&self, mut position: Point<Pixels>) -> Result<usize, usize> {
         let element_state = self.0.borrow();
         let element_state = element_state
+            .layout
             .as_ref()
             .expect("measurement has not been performed");
         let bounds = element_state
@@ -854,6 +887,7 @@ impl TextLayout {
     pub fn position_for_index(&self, index: usize) -> Option<Point<Pixels>> {
         let element_state = self.0.borrow();
         let element_state = element_state
+            .layout
             .as_ref()
             .expect("measurement has not been performed");
         let bounds = element_state
@@ -885,6 +919,7 @@ impl TextLayout {
     pub fn line_layout_for_index(&self, index: usize) -> Option<Arc<WrappedLineLayout>> {
         let element_state = self.0.borrow();
         let element_state = element_state
+            .layout
             .as_ref()
             .expect("measurement has not been performed");
         let mut line_start_ix = 0;
@@ -908,6 +943,7 @@ impl TextLayout {
     pub fn line_layouts(&self) -> SmallVec<[Arc<WrappedLineLayout>; 1]> {
         self.0
             .borrow()
+            .layout
             .as_ref()
             .expect("measurement has not been performed")
             .lines
@@ -918,23 +954,24 @@ impl TextLayout {
 
     /// The bounds of this layout.
     pub fn bounds(&self) -> Bounds<Pixels> {
-        self.0.borrow().as_ref().unwrap().bounds.unwrap()
+        self.0.borrow().layout.as_ref().unwrap().bounds.unwrap()
     }
 
     /// The line height for this layout.
     pub fn line_height(&self) -> Pixels {
-        self.0.borrow().as_ref().unwrap().line_height
+        self.0.borrow().layout.as_ref().unwrap().line_height
     }
 
     /// The UTF-8 length of the underlying text.
     pub fn len(&self) -> usize {
-        self.0.borrow().as_ref().unwrap().len
+        self.0.borrow().layout.as_ref().unwrap().len
     }
 
     /// The text for this layout.
     pub fn text(&self) -> String {
         self.0
             .borrow()
+            .layout
             .as_ref()
             .unwrap()
             .lines
@@ -947,7 +984,7 @@ impl TextLayout {
     pub fn wrapped_text(&self) -> String {
         let mut accumulator = String::new();
 
-        for wrapped in self.0.borrow().as_ref().unwrap().lines.iter() {
+        for wrapped in self.0.borrow().layout.as_ref().unwrap().lines.iter() {
             let mut seen = 0;
             for boundary in wrapped.layout.wrap_boundaries.iter() {
                 let index = wrapped.layout.unwrapped_layout.runs[boundary.run_ix].glyphs
@@ -1270,7 +1307,144 @@ impl IntoElement for InteractiveText {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate as gpui;
     use crate::px;
+
+    #[crate::test]
+    fn text_prepaint_restores_final_width_and_resolved_runs(cx: &mut crate::TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, _| crate::EmptyView);
+        cx.draw(
+            Point::default(),
+            crate::size(
+                crate::AvailableSpace::MaxContent,
+                crate::AvailableSpace::MaxContent,
+            ),
+            |window, cx| {
+                let text = SharedString::from("é日本語 Color Vision (Blue/Orange)");
+                let layout = TextLayout::default();
+                // A clone obtained before request_layout must see the current
+                // request ID as well as the final shaped layout.
+                let observed = layout.clone();
+                let (id, narrow, wide, expected) = window.with_text_style(
+                    Some(crate::TextStyleRefinement {
+                        font_family: Some(".ZedMono".into()),
+                        font_size: Some(px(16.).into()),
+                        white_space: Some(WhiteSpace::Nowrap),
+                        text_overflow: Some(TextOverflow::Truncate("…".into())),
+                        ..Default::default()
+                    }),
+                    |window| {
+                        let first_len = "é日本語 ".len();
+                        let mut first = window.text_style().to_run(first_len);
+                        first.color = crate::rgb(0xff0000).into();
+                        let mut second = window.text_style().to_run(text.len() - first_len);
+                        second.color = crate::rgb(0x0000ff).into();
+                        let runs = vec![first, second];
+                        let full = window
+                            .text_system()
+                            .shape_line(text.clone(), px(16.), &runs, None)
+                            .width;
+                        let narrow = crate::size(full * 0.7, px(24.));
+                        let wide = crate::size(full + px(20.), px(24.));
+                        let id = layout.layout(text.clone(), Some(runs), window, cx);
+                        window.refresh_measurement(id, narrow, cx);
+                        let expected = layout.text();
+                        assert!(expected.ends_with('…'));
+                        (id, narrow, wide, expected)
+                    },
+                );
+                // Model an intrinsic-size probe after the measurement Taffy
+                // will eventually select. It must not become the painted text.
+                window.refresh_measurement(id, wide, cx);
+                assert_eq!(layout.text(), text.as_ref());
+                observed.prepaint(Bounds::new(Point::default(), narrow), &text, window, cx);
+                assert_eq!(observed.text(), expected);
+                assert_eq!(observed.bounds().size, narrow);
+                assert_eq!(observed.len(), expected.len());
+                let lines = observed.line_layouts();
+                for run in &lines[0].unwrapped_layout.runs {
+                    for glyph in &run.glyphs {
+                        assert!(expected.is_char_boundary(glyph.index));
+                    }
+                }
+                let state = observed.0.borrow();
+                let decorations = &state.layout.as_ref().unwrap().lines[0].decoration_runs;
+                assert_eq!(decorations[0].color, crate::rgb(0xff0000).into());
+                assert_eq!(decorations[1].color, crate::rgb(0x0000ff).into());
+                assert_eq!(
+                    decorations
+                        .iter()
+                        .map(|run| run.len as usize)
+                        .sum::<usize>(),
+                    expected.len()
+                );
+                drop(state);
+                observed.prepaint(Bounds::new(Point::default(), narrow), &text, window, cx);
+                assert!(Arc::ptr_eq(&lines[0], &observed.line_layouts()[0]));
+                let replacement = SharedString::from("new request");
+                layout.layout(replacement.clone(), None, window, cx);
+                observed.prepaint(
+                    Bounds::new(Point::default(), narrow),
+                    &replacement,
+                    window,
+                    cx,
+                );
+                assert_eq!(observed.text(), replacement.as_ref());
+                crate::Empty
+            },
+        );
+    }
+
+    #[crate::test]
+    fn text_prepaint_preserves_clamp_with_final_known_width(cx: &mut crate::TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, _| crate::EmptyView);
+        cx.draw(
+            Point::default(),
+            crate::size(
+                crate::AvailableSpace::MaxContent,
+                crate::AvailableSpace::MaxContent,
+            ),
+            |window, cx| {
+                window.with_text_style(
+                    Some(crate::TextStyleRefinement {
+                        font_family: Some(".ZedMono".into()),
+                        font_size: Some(px(16.).into()),
+                        white_space: Some(WhiteSpace::Normal),
+                        text_overflow: Some(TextOverflow::Truncate("…".into())),
+                        line_clamp: Some(2),
+                        ..Default::default()
+                    }),
+                    |window| {
+                        let text =
+                            SharedString::from("alpha beta gamma delta epsilon zeta eta theta");
+                        let layout = TextLayout::default();
+                        let id = layout.layout(text.clone(), None, window, cx);
+                        window.compute_layout(
+                            id,
+                            crate::size(
+                                crate::AvailableSpace::Definite(px(80.)),
+                                crate::AvailableSpace::MaxContent,
+                            ),
+                            cx,
+                        );
+                        let expected = layout.text();
+                        assert!(expected.ends_with('…'));
+                        window.refresh_measurement(id, crate::size(px(800.), px(48.)), cx);
+                        assert_eq!(layout.text(), text.as_ref());
+                        layout.prepaint(
+                            Bounds::new(Point::default(), crate::size(px(80.), px(48.))),
+                            &text,
+                            window,
+                            cx,
+                        );
+                        assert_eq!(layout.text(), expected);
+                        assert!(layout.line_layouts()[0].wrap_boundaries.len() <= 1);
+                    },
+                );
+                crate::Empty
+            },
+        );
+    }
 
     fn cached_text_layout(
         wrap_width: Option<Pixels>,

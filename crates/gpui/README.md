@@ -61,7 +61,11 @@ the character-width `LineWrapper` used by editor callers is unchanged.
 Text measurement caches distinguish both wrapping and truncation widths,
 including unbounded requests. In particular, intrinsic measurement after a
 narrow truncated measurement must use the original text, not a cached ellipsis.
-Repeated measurements with identical constraints reuse the shaped layout.
+Repeated measurements with identical constraints reuse the shaped layout within
+the same text/style request. Before painting, text refreshes that original
+measurement closure at its final allocated size: Taffy may select cached geometry
+without repeating the measurement that produced it. This keeps painted text,
+decoration runs, and byte-index inspection aligned with the final bounds.
 
 ### Dependencies
 

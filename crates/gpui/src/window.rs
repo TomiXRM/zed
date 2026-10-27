@@ -4251,6 +4251,18 @@ impl Window {
         self.layout_engine = Some(layout_engine);
     }
 
+    pub(crate) fn refresh_measurement(
+        &mut self,
+        layout_id: LayoutId,
+        final_size: Size<Pixels>,
+        cx: &mut App,
+    ) {
+        self.invalidator.debug_assert_prepaint();
+        let mut layout_engine = self.layout_engine.take().unwrap();
+        layout_engine.refresh_measurement(layout_id, final_size, self, cx);
+        self.layout_engine = Some(layout_engine);
+    }
+
     /// Obtain the bounds computed for the given LayoutId relative to the window. This method will usually be invoked by
     /// GPUI itself automatically in order to pass your element its `Bounds` automatically.
     ///
