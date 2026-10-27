@@ -1270,6 +1270,7 @@ impl IntoElement for InteractiveText {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::px;
 
     fn cached_text_layout(
         wrap_width: Option<Pixels>,
